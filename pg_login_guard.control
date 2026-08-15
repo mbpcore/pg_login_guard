@@ -1,0 +1,4 @@
+comment = 'Lock a role after N failed login attempts within a rolling time window'
+default_version = '1.0'
+module_pathname = '$libdir/pg_login_guard'
+relocatable = false

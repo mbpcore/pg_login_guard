@@ -1,0 +1,11 @@
+# build artifacts (PGXS)
+*.o
+*.so
+*.dll
+*.dylib
+*.bc
+results/
+regression.diffs
+regression.out
+log/
+tmp_check/

@@ -1,0 +1,25 @@
+-- Basic smoke test for the admin-facing SQL functions.
+-- This does NOT exercise the ClientAuthentication_hook itself (that
+-- requires real connection attempts from an external client - see
+-- README.md for a manual walkthrough with psql).
+CREATE EXTENSION pg_login_guard;
+-- No failed logins recorded yet in a fresh session.
+SELECT * FROM pg_login_guard_status();
+ role_name | failed_attempts | window_started_at | locked_until
+-----------+------------------+--------------------+--------------
+(0 rows)
+
+-- Operations on a role with no tracking entry are no-ops that return false.
+SELECT pg_login_guard_unlock('no_such_role');
+ pg_login_guard_unlock
+------------------------
+ f
+(1 row)
+
+SELECT pg_login_guard_reset('no_such_role');
+ pg_login_guard_reset
+-----------------------
+ f
+(1 row)
+
+DROP EXTENSION pg_login_guard;
