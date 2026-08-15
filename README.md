@@ -17,12 +17,27 @@ as fail2ban's in-memory ban list.
 
 ## Status
 
-This is a fresh scaffold — the C code is written and believed correct,
-but it has **not yet been compiled or tested against a running
-PostgreSQL server** in this environment (no PostgreSQL installation or C
-toolchain was present on this machine at project-creation time). Build
-it and run the smoke test before relying on it. See
-[Build & install](#build--install) below.
+Built and exercised end-to-end against PostgreSQL 18.6 (MSYS2
+`mingw-w64-x86_64-postgresql`, GCC 16.2.0): 3 real failed SCRAM logins
+trip the lock, a 4th attempt with the *correct* password is rejected
+with the expected `FATAL`/`DETAIL`/`HINT`, the lock lifts on its own
+once `lockout_duration` elapses, and `pg_login_guard_unlock()` lifts it
+on demand. `make installcheck` passes. See
+[Build & install](#build--install) to reproduce.
+
+A real bug was found and fixed along the way: the original code used
+`RequestNamedLWLockTranche()` / `GetNamedLWLockTranche()` for its lock.
+On this Windows/EXEC_BACKEND build, the bookkeeping array that
+mechanism depends on didn't make it into child processes (checkpointer,
+io workers) reliably, crashing them at startup with access violations
+the moment any preloaded module (not just this one) called
+`GetNamedLWLockTranche()` outside of the process that first created it.
+The fix embeds the `LWLock` directly inside our own
+`ShmemInitStruct`-allocated state and identifies it via
+`LWLockNewTrancheId()`/`LWLockRegisterTranche()` instead — see the
+comment above `LoginGuardShmemState` in [pg_login_guard.c](pg_login_guard.c).
+This is very likely a Linux/WSL non-issue; it was only reproduced (and
+fixed) against the specific MSYS2 Windows package above.
 
 ## How it decides to lock
 
@@ -42,12 +57,12 @@ Inside the auth hook, per connection attempt:
 ## Files
 
 ```
-pg_login_guard.control            extension control file
-pg_login_guard.c                  C implementation (the hook + admin functions)
-sql/pg_login_guard--1.0.sql       SQL objects installed by CREATE EXTENSION
-Makefile                          PGXS build file
-test/pg_login_guard_admin.sql     pg_regress smoke test (admin functions only)
-test/pg_login_guard_admin.out     expected output for the smoke test
+pg_login_guard.control                      extension control file
+pg_login_guard.c                            C implementation (the hook + admin functions)
+sql/pg_login_guard--1.0.sql                 SQL objects installed by CREATE EXTENSION
+Makefile                                    PGXS build file
+test/sql/pg_login_guard_admin.sql           pg_regress smoke test (admin functions only)
+test/expected/pg_login_guard_admin.out      expected output for the smoke test
 ```
 
 ## Build & install
@@ -66,9 +81,17 @@ sudo make install
 
 ### Option B — Windows with MSYS2/MinGW-w64
 
-Install PostgreSQL for Windows (EDB installer, includes `pg_config` and
-headers) and MSYS2 with the `mingw-w64-x86_64-toolchain` group. From a
-MinGW64 shell, with PostgreSQL's `bin` directory on `PATH`:
+This is the path actually used to build and test this extension. Install
+[MSYS2](https://www.msys2.org/), then from an **MSYS2 MinGW64** shell:
+
+```bash
+pacman -Syu                          # first run: it'll ask to close & reopen the shell, then re-run this
+pacman -S --needed mingw-w64-x86_64-postgresql mingw-w64-x86_64-gcc make mingw-w64-x86_64-diffutils
+```
+
+(`diffutils` is only needed to run `make installcheck`.) Then, from that
+same MinGW64 shell (make sure `/mingw64/bin` is on `PATH`, which it is
+by default in that shell):
 
 ```bash
 cd /d/pg_extension/pg_login_guard
@@ -76,10 +99,40 @@ make
 make install
 ```
 
-If `pg_config --pgxs` or the build fails due to compiler mismatch
-(MSVC-built PostgreSQL vs. MinGW `gcc`), building under WSL against a
-Linux PostgreSQL install is the more reliable path — or build with MSVC
-via `nmake` and PostgreSQL's `src/tools/msvc` build scripts.
+This installs a real PostgreSQL server (`pg_config`, `initdb`, `pg_ctl`,
+`psql`, ...) matched to the same MinGW GCC used to build the extension —
+no compiler-ABI mismatch. See [Windows gotchas](#windows-gotchas-msys2)
+below for environment quirks you'll hit when standing up a test cluster
+this way.
+
+If you instead have an EDB-installed (MSVC-built) PostgreSQL on
+`PATH`, plain PGXS `make` will generally *not* link, since its `gcc`
+and that build's MSVC ABI don't match. Either use the MSYS2 route above
+(installs its own compiler-matched PostgreSQL, side by side with any
+other install) or build with MSVC via `nmake` and PostgreSQL's
+`src/tools/msvc` scripts.
+
+### Windows gotchas (MSYS2)
+
+Hit while standing up a local test cluster; not specific to this
+extension, but worth knowing:
+
+- **PG18's io-worker subsystem crashes on this build.** If you see
+  `io worker (PID ...) was terminated by exception 0xC0000005` in the
+  log right after startup, add `io_method = sync` to `postgresql.conf`.
+  Unrelated to `pg_login_guard` — reproduces with *no* preload libraries
+  at all.
+- **No Unix-domain socket by default**, so `psql` with no `-h` fails
+  with "Connection refused" even though `pg_hba.conf` has a `local`
+  line. Connect over TCP (`-h 127.0.0.1`) instead, or set
+  `unix_socket_directories` and confirm your Windows version supports
+  `AF_UNIX`.
+- **The `postgres` superuser has no password after `initdb`.** If
+  `pg_hba.conf` requires `scram-sha-256` for TCP before you've set one,
+  `psql` blocks forever on a password prompt it never receives (no TTY).
+  Set `pg_hba.conf` to `trust` first, `pg_ctl reload`, run
+  `ALTER ROLE postgres PASSWORD '...'`, then switch back to
+  `scram-sha-256` and reload again.
 
 ## Configure
 
@@ -149,10 +202,10 @@ make installcheck   # requires a running server matching pg_config, and
                      # PGUSER with rights to CREATE EXTENSION
 ```
 
-`test/pg_login_guard_admin.out` was hand-written to match expected
-`psql` formatting; if `make installcheck` reports only whitespace/column
--width diffs, copy `results/pg_login_guard_admin.out` over
-`test/pg_login_guard_admin.out` and re-run to confirm a clean pass.
+If it reports only whitespace/column-width diffs against your build,
+copy `test/results/pg_login_guard_admin.out` over
+`test/expected/pg_login_guard_admin.out` and re-run to confirm a clean
+pass.
 
 ## Known limitations / ideas for later
 

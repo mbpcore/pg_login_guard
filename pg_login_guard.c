@@ -41,6 +41,24 @@ typedef struct LoginGuardEntry
     TimestampTz locked_until;           /* 0 = not locked */
 } LoginGuardEntry;
 
+/*
+ * A single ad hoc LWLock, allocated inside our own shared-memory struct
+ * and identified via LWLockNewTrancheId()/LWLockRegisterTranche(), rather
+ * than via RequestNamedLWLockTranche()/GetNamedLWLockTranche(). The named-
+ * tranche path relies on postmaster.c copying a backend-local bookkeeping
+ * array to EXEC_BACKEND child processes (Windows); that copy did not
+ * happen reliably for third-party preloaded modules when this was tested
+ * (checkpointer/io-worker crashed on GetNamedLWLockTranche() at startup).
+ * A lock embedded in our own ShmemInitStruct-allocated memory needs no
+ * such per-process bookkeeping to be re-synchronized, since it's plain
+ * shared data that every process reattaches to identically.
+ */
+typedef struct LoginGuardShmemState
+{
+    LWLock      lock;
+    int         trancheId;
+} LoginGuardShmemState;
+
 static HTAB    *loginGuardHash = NULL;
 static LWLock  *loginGuardLock = NULL;
 
@@ -129,7 +147,6 @@ _PG_init(void)
 #else
     /* On pre-15 there is no shmem_request_hook; request directly. */
     RequestAddinShmemSpace(pg_login_guard_memsize());
-    RequestNamedLWLockTranche("pg_login_guard", 1);
 #endif
 
     prev_shmem_startup_hook = shmem_startup_hook;
@@ -142,7 +159,11 @@ _PG_init(void)
 static Size
 pg_login_guard_memsize(void)
 {
-    return hash_estimate_size(guard_max_tracked_roles, sizeof(LoginGuardEntry));
+    Size        size;
+
+    size = MAXALIGN(sizeof(LoginGuardShmemState));
+    size = add_size(size, hash_estimate_size(guard_max_tracked_roles, sizeof(LoginGuardEntry)));
+    return size;
 }
 
 #if PG_VERSION_NUM >= 150000
@@ -153,7 +174,6 @@ pg_login_guard_shmem_request(void)
         prev_shmem_request_hook();
 
     RequestAddinShmemSpace(pg_login_guard_memsize());
-    RequestNamedLWLockTranche("pg_login_guard", 1);
 }
 #endif
 
@@ -161,25 +181,35 @@ static void
 pg_login_guard_shmem_startup(void)
 {
     HASHCTL     info;
+    bool        found;
+    LoginGuardShmemState *state;
 
     if (prev_shmem_startup_hook)
         prev_shmem_startup_hook();
 
     loginGuardHash = NULL;
 
+    LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+
+    state = (LoginGuardShmemState *)
+        ShmemInitStruct("pg_login_guard state", sizeof(LoginGuardShmemState), &found);
+    if (!found)
+    {
+        state->trancheId = LWLockNewTrancheId();
+        LWLockInitialize(&state->lock, state->trancheId);
+    }
+    LWLockRegisterTranche(state->trancheId, "pg_login_guard");
+    loginGuardLock = &state->lock;
+
     memset(&info, 0, sizeof(info));
     info.keysize = NAMEDATALEN;
     info.entrysize = sizeof(LoginGuardEntry);
-
-    LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
 
     loginGuardHash = ShmemInitHash("pg_login_guard hash",
                                     guard_max_tracked_roles,
                                     guard_max_tracked_roles,
                                     &info,
                                     HASH_ELEM | HASH_STRINGS);
-
-    loginGuardLock = &(GetNamedLWLockTranche("pg_login_guard"))[0].lock;
 
     LWLockRelease(AddinShmemInitLock);
 }
