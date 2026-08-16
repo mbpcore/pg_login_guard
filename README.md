@@ -207,6 +207,62 @@ copy `test/results/pg_login_guard_admin.out` over
 `test/expected/pg_login_guard_admin.out` and re-run to confirm a clean
 pass.
 
+## Security considerations
+
+- **Any account (including `postgres`) can be locked out by someone with
+  no credentials at all** — that's the fundamental nature of a lockout
+  policy, not a bug specific to this extension (the same is true of
+  fail2ban, AD account-lockout policies, etc.). Anyone who knows a role
+  name can lock it by deliberately failing to authenticate as it
+  `max_attempts` times. Weigh this before enabling for roles where
+  availability matters more than brute-force resistance, and consider
+  excluding your break-glass superuser role once an allowlist exists
+  (see Known limitations below).
+- **Fake-username table exhaustion.** The shared-memory tracking table
+  has a fixed capacity (`pg_login_guard.max_tracked_roles`, default
+  1000). `ClientAuthentication_hook` fires — and a tracking entry gets
+  created — for *any* attempted username, including ones that don't
+  correspond to a real role. An unauthenticated remote attacker can
+  send `max_tracked_roles` failed connections using that many distinct
+  made-up usernames (cheap — no valid credentials needed for any of
+  them) to fill the table. Once full, new entries are silently dropped
+  (a `WARNING` is logged) — meaning brute-force tracking is effectively
+  disabled for every *real* role until a restart or enough entries
+  clear naturally. There's no eviction of stale/never-succeeded entries
+  today. Practical mitigations: size `max_tracked_roles` well above your
+  real role count so this requires a large sustained attempt volume,
+  watch the server log for the `tracking table is full` warning, and/or
+  restrict which addresses can attempt authentication at all via
+  `pg_hba.conf`. A real fix would be to only create a tracking entry for
+  usernames that resolve to an existing role, or add LRU eviction —
+  both are non-trivial from inside this hook (catalog lookups need a
+  transaction context that isn't reliably available this early) and
+  aren't implemented yet.
+- `pg_login_guard_status()` is superuser-only by default (as of the
+  `REVOKE ALL ... FROM PUBLIC` in the install script) — earlier it was
+  left PUBLIC-readable, which handed any authenticated user in the
+  database role names, attempt counts, and exact lock-expiry timestamps
+  for reconnaissance purposes. `GRANT` it explicitly to a monitoring
+  role if you want non-superusers to see it.
+
+## Performance
+
+Per connection attempt, the hook does one hash-table lookup/insert under
+a single shared-memory `LWLock`, held exclusively for a handful of
+`memcpy`/comparison operations — no disk I/O, no catalog access, no
+extra network round trip. That's negligible next to the cost of a
+SCRAM handshake and process/backend startup itself. The one shared lock
+is a global serialization point across all connecting backends, so it
+could show up in profiles on workloads doing very high-frequency new
+connections (thousands/sec, e.g. an app connecting without a pooler) —
+but the critical section is short enough that this is unlikely to be
+the bottleneck before other server limits are. `pg_login_guard_status()`
+holds a shared lock for a full table scan, proportional to
+`max_tracked_roles`; harmless at the default (1000) but worth knowing
+if you raise that a lot and poll `status()` frequently. Steady-state
+shared memory footprint is small and fixed at startup (~90KB at the
+default `max_tracked_roles`, scaling linearly with it).
+
 ## Known limitations / ideas for later
 
 - State lives in shared memory only: a server restart clears all
@@ -216,5 +272,5 @@ pass.
 - No per-IP tracking (only per-role); an attacker rotating through many
   roles from one IP isn't slowed down. Could be extended to key on
   `(rolename, client_addr)` or add a separate per-IP table.
-- No allowlist for exempting specific roles (e.g. replication roles)
-  from lockout — everyone is tracked today.
+- No allowlist for exempting specific roles (e.g. replication roles, a
+  break-glass superuser) from lockout — everyone is tracked today.

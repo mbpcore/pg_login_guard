@@ -38,5 +38,11 @@ COMMENT ON FUNCTION pg_login_guard_reset(text) IS
 
 REVOKE ALL ON FUNCTION pg_login_guard_unlock(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_login_guard_reset(text) FROM PUBLIC;
--- pg_login_guard_status() is left readable by PUBLIC (no secrets exposed,
--- just role names/counters); tighten with REVOKE if you'd rather not.
+
+-- Not secrets, but role names + attempt counts + lock-expiry timestamps
+-- are still reconnaissance value (which accounts exist/are under attack,
+-- and exactly when a lock lifts) that an arbitrary authenticated user in
+-- this database has no need to see. Default to superuser-only, like the
+-- two functions above; GRANT to a specific monitoring role if wanted, e.g.:
+--   GRANT EXECUTE ON FUNCTION pg_login_guard_status() TO pg_monitor;
+REVOKE ALL ON FUNCTION pg_login_guard_status() FROM PUBLIC;
