@@ -23,7 +23,9 @@ trip the lock, a 4th attempt with the *correct* password is rejected
 with the expected `FATAL`/`DETAIL`/`HINT`, the lock lifts on its own
 once `lockout_duration` elapses, and `pg_login_guard_unlock()` lifts it
 on demand. `make installcheck` passes. See
-[Build & install](#build--install) to reproduce.
+[Supported PostgreSQL versions](#supported-postgresql-versions) for
+what's been checked on 16/17, and [Build & install](#build--install) to
+reproduce any of this yourself.
 
 A real bug was found and fixed along the way: the original code used
 `RequestNamedLWLockTranche()` / `GetNamedLWLockTranche()` for its lock.
@@ -67,21 +69,86 @@ test/expected/pg_login_guard_admin.out      expected output for the smoke test
 
 ## Build & install
 
-You need PostgreSQL's server development files (`pg_config` on `PATH`)
-and a C compiler matching the one PostgreSQL itself was built with.
+### Supported PostgreSQL versions
 
-### Option A — WSL / Linux (recommended, least friction)
+**PostgreSQL 16, 17, and 18.** The code targets the modern
+`shmem_request_hook` (PG15+) shared-memory API and `MarkGUCPrefixReserved`
+(PG16+), with a compile-time fallback (`#if PG_VERSION_NUM >= 150000`) for
+older 13–14 servers using the pre-15 shared-memory request API — so it
+*should* build on 13+, but only 16/17/18 have actually been checked
+against upstream source and/or run live. `pg_login_guard.control` pins
+`default_version = '1.0'` regardless of server version; there's nothing
+version-specific in the SQL.
+
+You need two things, matched to each other: a PostgreSQL **server
+development package** for your target major version (it ships
+`pg_config`, headers, and the PGXS build makefiles) and a **C compiler**
+that's ABI-compatible with the PostgreSQL binary you'll load the
+extension into. Pick the section for your platform below.
+
+### Linux — Debian / Ubuntu
+
+Ubuntu's/Debian's own repos often lag behind or only carry one PG major
+version. Use the official PGDG apt repository instead so you can pick
+16, 17, or 18 explicitly:
 
 ```bash
-sudo apt install postgresql-server-dev-17 build-essential   # match your PG version
+sudo apt install -y postgresql-common ca-certificates
+sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh
+sudo apt update
+
+# pick ONE of these, matching the server you'll load the extension into:
+sudo apt install -y postgresql-16 postgresql-server-dev-16 build-essential
+sudo apt install -y postgresql-17 postgresql-server-dev-17 build-essential
+sudo apt install -y postgresql-18 postgresql-server-dev-18 build-essential
+```
+
+Then build and install:
+
+```bash
 cd pg_login_guard
-make
+make                # uses `pg_config` on PATH — if you have multiple
+                     # versions installed, run e.g.
+                     # make PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
 sudo make install
 ```
 
-### Option B — Windows with MSYS2/MinGW-w64
+### Linux — RHEL / Rocky / AlmaLinux (and other EL-family)
 
-This is the path actually used to build and test this extension. Install
+Via the official PGDG yum/dnf repository (example for EL9 — swap
+`EL-9-x86_64` for your release from [yum.postgresql.org](https://yum.postgresql.org/)
+if different, and `16` for `17`/`18`):
+
+```bash
+sudo dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-x86_64/pgdg-redhat-repo-latest.noarch.rpm
+sudo dnf -qy module disable postgresql   # step aside for PGDG's own versioned packages
+sudo dnf install -y postgresql16-server postgresql16-devel gcc make
+```
+
+```bash
+cd pg_login_guard
+export PG_CONFIG=/usr/pgsql-16/bin/pg_config   # adjust for your version
+make PG_CONFIG=$PG_CONFIG
+sudo make install PG_CONFIG=$PG_CONFIG
+```
+
+### macOS — Homebrew
+
+```bash
+brew install postgresql@16   # or @17 / @18
+export PATH="$(brew --prefix postgresql@16)/bin:$PATH"
+
+cd pg_login_guard
+make
+make install     # Homebrew-owned prefix, usually no sudo needed
+```
+
+### Windows — MSYS2/MinGW-w64
+
+This is the path actually used to build and test this extension (against
+the version MSYS2 currently packages — 18.6 as of this writing; MSYS2 is
+a rolling repo and doesn't offer older majors side by side, so this route
+is really only for "whatever's current," i.e. 18 today). Install
 [MSYS2](https://www.msys2.org/), then from an **MSYS2 MinGW64** shell:
 
 ```bash
@@ -105,12 +172,13 @@ no compiler-ABI mismatch. See [Windows gotchas](#windows-gotchas-msys2)
 below for environment quirks you'll hit when standing up a test cluster
 this way.
 
-If you instead have an EDB-installed (MSVC-built) PostgreSQL on
-`PATH`, plain PGXS `make` will generally *not* link, since its `gcc`
-and that build's MSVC ABI don't match. Either use the MSYS2 route above
-(installs its own compiler-matched PostgreSQL, side by side with any
-other install) or build with MSVC via `nmake` and PostgreSQL's
-`src/tools/msvc` scripts.
+If you specifically need Windows + PG16 or PG17 (not whatever MSYS2
+currently packages), or you already have an EDB-installed (MSVC-built)
+PostgreSQL on `PATH`: plain PGXS `make` will generally *not* link against
+it, since MinGW `gcc` and MSVC have incompatible ABIs. Either build with
+MSVC via `nmake` and PostgreSQL's `src/tools/msvc` scripts, or — much
+less friction — install that PG version under WSL and use the Linux
+instructions above.
 
 ### Windows gotchas (MSYS2)
 
