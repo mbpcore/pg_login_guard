@@ -1,5 +1,7 @@
 # pg_login_guard
 
+By **Md. Masum Billah** ([mbpcore@gmail.com](mailto:mbpcore@gmail.com))
+
 A small PostgreSQL extension that locks a role out after too many failed
 login attempts in a row, fail2ban-style:
 
@@ -342,3 +344,12 @@ default `max_tracked_roles`, scaling linearly with it).
   `(rolename, client_addr)` or add a separate per-IP table.
 - No allowlist for exempting specific roles (e.g. replication roles, a
   break-glass superuser) from lockout — everyone is tracked today.
+
+## Author
+
+**Md. Masum Billah**
+Contact: [mbpcore@gmail.com](mailto:mbpcore@gmail.com)
+
+## License
+
+[MIT](LICENSE) — Copyright (c) 2026 Md. Masum Billah.
