@@ -124,8 +124,19 @@ if different, and `16` for `17`/`18`):
 ```bash
 sudo dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-x86_64/pgdg-redhat-repo-latest.noarch.rpm
 sudo dnf -qy module disable postgresql   # step aside for PGDG's own versioned packages
-sudo dnf install -y postgresql16-server postgresql16-devel gcc make
+sudo dnf install -y postgresql16-server postgresql16-devel gcc make krb5-devel
 ```
+
+`krb5-devel` is there because [pg_login_guard.c](pg_login_guard.c)
+includes `libpq/auth.h` (needed for `ClientAuthentication_hook`), which
+pulls in GSSAPI/Kerberos headers whenever the target server was built
+with GSSAPI support — true of PGDG's EL9 packages. **Confirmed on RHEL
+9:** required to build against PostgreSQL 18's `postgresql18-devel`,
+but not needed against 16 or 17 on the same OS. Since that could easily
+shift with future point releases, just install it up front regardless
+of version rather than relying on which majors currently need it. If
+you skip it and the build fails on a missing `gssapi/gssapi.h` or
+`krb5.h`, this package is why.
 
 ```bash
 cd pg_login_guard
