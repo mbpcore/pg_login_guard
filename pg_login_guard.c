@@ -385,6 +385,21 @@ pg_login_guard_status(PG_FUNCTION_ARGS)
     hash_seq_init(&seq, loginGuardHash);
     while (n < cap && (entry = (LoginGuardEntry *) hash_seq_search(&seq)) != NULL)
         snapshot[n++] = *entry;
+    /*
+     * If the table is completely full (n reached cap on a successful,
+     * non-NULL entry) we never made the one further hash_seq_search()
+     * call that would have returned NULL and self-terminated the scan.
+     * Per dynahash's contract, an abandoned scan must be explicitly
+     * terminated, or it leaks a slot in this backend's fixed-size
+     * (MAX_SEQ_SCANS = 100) active-scan table forever; after enough
+     * abandoned scans in one long-lived session, unrelated hash_seq_init
+     * calls elsewhere in the backend start failing with "too many active
+     * hash_seq_search scans". n < cap means hash_seq_search returned NULL
+     * on its own and already did this cleanup, so only call it when we
+     * stopped due to hitting cap instead.
+     */
+    if (n == cap)
+        hash_seq_term(&seq);
     LWLockRelease(loginGuardLock);
 
     for (i = 0; i < n; i++)

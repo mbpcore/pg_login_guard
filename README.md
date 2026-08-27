@@ -89,7 +89,7 @@ Then build and install:
 cd pg_login_guard
 make                # uses `pg_config` on PATH — if you have multiple
                      # versions installed, run e.g.
-                     # make PG_CONFIG=/usr/pgsql-17/bin/pg_config
+                     # make PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
 sudo make install
 ```
 
@@ -199,6 +199,17 @@ pg_login_guard.lockout_duration = '15min'
 pg_login_guard.max_tracked_roles = 1000  # requires restart to change
 ```
 
+> **Upgrading from a build with `pg_login_guard.window` (no `_seconds`)?**
+> That name was changed because `WINDOW` is a reserved word in
+> PostgreSQL's SQL grammar — `SHOW pg_login_guard.window` and
+> `ALTER SYSTEM SET pg_login_guard.window = ...` fail with a syntax
+> error, since a bare reserved word can't appear there unquoted. Rename
+> it to `pg_login_guard.window_seconds` in `postgresql.conf`. If you
+> don't, PostgreSQL logs a startup warning about an unrecognized
+> parameter under a reserved prefix and silently falls back to the
+> 5-minute default instead of your configured value — no crash, but not
+> what you asked for either.
+
 Restart PostgreSQL, then in any database:
 
 ```sql
@@ -269,19 +280,36 @@ pass.
 - **Fake-username table exhaustion.** The shared-memory tracking table
   has a fixed capacity (`pg_login_guard.max_tracked_roles`, default
   1000). `ClientAuthentication_hook` fires — and a tracking entry gets
-  created — for *any* attempted username, including ones that don't
-  correspond to a real role. An unauthenticated remote attacker can
-  send `max_tracked_roles` failed connections using that many distinct
-  made-up usernames (cheap — no valid credentials needed for any of
-  them) to fill the table. Once full, new entries are silently dropped
-  (a `WARNING` is logged) — meaning brute-force tracking is effectively
-  disabled for every *real* role until a restart or enough entries
-  clear naturally. There's no eviction of stale/never-succeeded entries
-  today. Practical mitigations: size `max_tracked_roles` well above your
-  real role count so this requires a large sustained attempt volume,
-  watch the server log for the `tracking table is full` warning, and/or
-  restrict which addresses can attempt authentication at all via
-  `pg_hba.conf`. A real fix would be to only create a tracking entry for
+  created — for *any* attempted username that reaches a `pg_hba.conf`
+  line using a credential-checking method (`password`, `md5`,
+  `scram-sha-256`, `gss`, ...), including ones that don't correspond to
+  a real role — PostgreSQL runs a mock authentication exchange for a
+  nonexistent role specifically so a failure doesn't reveal whether the
+  role exists, and that mock exchange still reports failure through the
+  normal path our hook sees. An unauthenticated remote attacker can
+  exploit this: send `max_tracked_roles` failed connections using that
+  many distinct made-up usernames (cheap — no valid credentials needed
+  for any of them) to fill the table. Once full, new entries are
+  silently dropped (a `WARNING` is logged) — meaning brute-force
+  tracking is effectively disabled for every *real* role until a
+  restart or enough entries clear naturally. There's no eviction of
+  stale/never-succeeded entries today. This is narrower than it sounds
+  if your `pg_hba.conf` is otherwise locked down: connections rejected
+  by an explicit `reject` line, or that don't match *any* line
+  (PostgreSQL's implicit reject), never reach `ClientAuthentication()`'s
+  hook-invocation code at all — `ereport(FATAL, ...)` fires straight
+  from inside the `reject`/implicit-reject branch, so that traffic can't
+  contribute to this exhaustion. It's a real risk specifically for the
+  realistic case this extension exists for: a `pg_hba.conf` line
+  offering `scram-sha-256`/`md5`/`password` broadly (e.g. to any host,
+  for any role) so legitimate remote clients can authenticate at all —
+  by construction, that same line accepts an attacker's made-up
+  usernames into the mock-auth path too. Practical mitigations: size
+  `max_tracked_roles` well above your real role count so this requires
+  a large sustained attempt volume, watch the server log for the
+  `tracking table is full` warning, and/or scope that `pg_hba.conf` line
+  as tightly as you can (specific source addresses/networks rather than
+  `0.0.0.0/0`). A real fix would be to only create a tracking entry for
   usernames that resolve to an existing role, or add LRU eviction —
   both are non-trivial from inside this hook (catalog lookups need a
   transaction context that isn't reliably available this early) and
@@ -292,6 +320,30 @@ pass.
   database role names, attempt counts, and exact lock-expiry timestamps
   for reconnaissance purposes. `GRANT` it explicitly to a monitoring
   role if you want non-superusers to see it.
+- **Fixed: a full-table `pg_login_guard_status()` call could crash the
+  whole server.** When the tracking table was completely full, the
+  status function's `hash_seq_search()` loop stopped right at capacity
+  without the one further call that would've returned `NULL` and
+  self-terminated the scan — an "abandoned" scan per dynahash's
+  documented contract, which must be explicitly closed with
+  `hash_seq_term()` or it leaks a slot in that backend's fixed-size
+  (100-slot) active-scan table. Confirmed by testing: repeatedly calling
+  `pg_login_guard_status()` in one session while the table was full
+  eventually threw `"too many active hash_seq_search scans"` against
+  our own hash table, then cascaded into the same error against
+  PostgreSQL's *internal* `Portal hash` table, then an abort-loop, then
+  `PANIC: ERRORDATA_STACK_SIZE exceeded` — which crashes the whole
+  server (PostgreSQL treats any backend `PANIC` as a possible
+  shared-memory corruption signal and restarts every process). A
+  negative control confirmed the unfixed code reproduces this
+  reliably, and the fix (an explicit `hash_seq_term()` call when the
+  loop hits capacity) survives 300 consecutive full-table calls in one
+  session with no leak and no crash. Practically: this only triggers
+  while the table is at 100% capacity, which is also exactly the
+  fake-username-exhaustion scenario above — so it mattered most for
+  anyone actively monitoring `pg_login_guard_status()` during an
+  ongoing attack, which is a fairly likely thing to be doing at exactly
+  that moment.
 
 ## Performance
 
