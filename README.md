@@ -89,7 +89,7 @@ Then build and install:
 cd pg_login_guard
 make                # uses `pg_config` on PATH — if you have multiple
                      # versions installed, run e.g.
-                     # make PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+                     # make PG_CONFIG=/usr/pgsql-17/bin/pg_config
 sudo make install
 ```
 
