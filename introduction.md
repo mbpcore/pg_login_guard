@@ -106,7 +106,7 @@ all:
 |---|---|---|---|
 | `pg_login_guard.enabled` | `on` | Yes (`SIGHUP`) | Kill switch — turn tracking/locking off without restarting or removing the library. |
 | `pg_login_guard.max_attempts` | `5` | Yes (`SIGHUP`) | Number of failures within `window` before a role gets locked. |
-| `pg_login_guard.window` | `5min` | Yes (`SIGHUP`) | Time span failures are counted within. Accepts unit suffixes (`s`, `min`, `h`). |
+| `pg_login_guard.window_seconds` | `5min` | Yes (`SIGHUP`) | Time span failures are counted within. Accepts unit suffixes (`s`, `min`, `h`). |
 | `pg_login_guard.lockout_duration` | `15min` | Yes (`SIGHUP`) | How long a role stays locked once tripped. |
 | `pg_login_guard.max_tracked_roles` | `1000` | **No** (`PGC_POSTMASTER` — requires restart) | Capacity of the shared-memory table; sizes it at server startup. |
 
@@ -116,7 +116,7 @@ Example:
 shared_preload_libraries = 'pg_login_guard'
 
 pg_login_guard.max_attempts = 5
-pg_login_guard.window = '5min'
+pg_login_guard.window_seconds = '5min'
 pg_login_guard.lockout_duration = '15min'
 pg_login_guard.max_tracked_roles = 1000
 ```

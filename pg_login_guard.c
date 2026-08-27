@@ -115,7 +115,14 @@ _PG_init(void)
                              PGC_SIGHUP, 0,
                              NULL, NULL, NULL);
 
-    DefineCustomIntVariable("pg_login_guard.window",
+    /*
+     * Named "window_seconds", not "window": WINDOW is a reserved word in
+     * PostgreSQL's SQL grammar, so a GUC named "pg_login_guard.window"
+     * cannot be referenced bare in SHOW/SET/ALTER SYSTEM SET (all fail
+     * with "syntax error at or near \"window\"") - only via
+     * current_setting() or a fully double-quoted identifier.
+     */
+    DefineCustomIntVariable("pg_login_guard.window_seconds",
                              "Rolling time window in which failed attempts are counted.",
                              NULL,
                              &guard_window_seconds,

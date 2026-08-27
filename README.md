@@ -17,32 +17,6 @@ memory table (no extra catalog tables, no writes-during-auth headaches),
 guarded by a single lightweight lock. It resets on server restart, same
 as fail2ban's in-memory ban list.
 
-## Status
-
-Built and exercised end-to-end against PostgreSQL 18.6 (MSYS2
-`mingw-w64-x86_64-postgresql`, GCC 16.2.0): 3 real failed SCRAM logins
-trip the lock, a 4th attempt with the *correct* password is rejected
-with the expected `FATAL`/`DETAIL`/`HINT`, the lock lifts on its own
-once `lockout_duration` elapses, and `pg_login_guard_unlock()` lifts it
-on demand. `make installcheck` passes. See
-[Supported PostgreSQL versions](#supported-postgresql-versions) for
-what's been checked on 16/17, and [Build & install](#build--install) to
-reproduce any of this yourself.
-
-A real bug was found and fixed along the way: the original code used
-`RequestNamedLWLockTranche()` / `GetNamedLWLockTranche()` for its lock.
-On this Windows/EXEC_BACKEND build, the bookkeeping array that
-mechanism depends on didn't make it into child processes (checkpointer,
-io workers) reliably, crashing them at startup with access violations
-the moment any preloaded module (not just this one) called
-`GetNamedLWLockTranche()` outside of the process that first created it.
-The fix embeds the `LWLock` directly inside our own
-`ShmemInitStruct`-allocated state and identifies it via
-`LWLockNewTrancheId()`/`LWLockRegisterTranche()` instead — see the
-comment above `LoginGuardShmemState` in [pg_login_guard.c](pg_login_guard.c).
-This is very likely a Linux/WSL non-issue; it was only reproduced (and
-fixed) against the specific MSYS2 Windows package above.
-
 ## How it decides to lock
 
 Inside the auth hook, per connection attempt:
@@ -73,12 +47,16 @@ test/expected/pg_login_guard_admin.out      expected output for the smoke test
 
 ### Supported PostgreSQL versions
 
-**PostgreSQL 16, 17, and 18.** The code targets the modern
-`shmem_request_hook` (PG15+) shared-memory API and `MarkGUCPrefixReserved`
-(PG16+), with a compile-time fallback (`#if PG_VERSION_NUM >= 150000`) for
-older 13–14 servers using the pre-15 shared-memory request API — so it
-*should* build on 13+, but only 16/17/18 have actually been checked
-against upstream source and/or run live. `pg_login_guard.control` pins
+**PostgreSQL 16, 17, and 18 — 16 is the minimum that will compile.** The
+code calls `MarkGUCPrefixReserved()`, which was introduced in PG16, with
+no version guard around it, so builds against PG13–15 headers fail at
+compile time. (There *is* a compile-time fallback,
+`#if PG_VERSION_NUM >= 150000`, for the older pre-15
+`shmem_request_hook`-less shared-memory request API — but that only
+covers the shared-memory setup, not the `MarkGUCPrefixReserved` call, so
+it doesn't get you down to 13/14 on its own.) Of the versions that do
+compile, only 16/17/18 have actually been checked against upstream
+source and/or run live. `pg_login_guard.control` pins
 `default_version = '1.0'` regardless of server version; there's nothing
 version-specific in the SQL.
 
@@ -124,19 +102,8 @@ if different, and `16` for `17`/`18`):
 ```bash
 sudo dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-x86_64/pgdg-redhat-repo-latest.noarch.rpm
 sudo dnf -qy module disable postgresql   # step aside for PGDG's own versioned packages
-sudo dnf install -y postgresql16-server postgresql16-devel gcc make krb5-devel
+sudo dnf install -y postgresql16-server postgresql16-devel gcc make
 ```
-
-`krb5-devel` is there because [pg_login_guard.c](pg_login_guard.c)
-includes `libpq/auth.h` (needed for `ClientAuthentication_hook`), which
-pulls in GSSAPI/Kerberos headers whenever the target server was built
-with GSSAPI support — true of PGDG's EL9 packages. **Confirmed on RHEL
-9:** required to build against PostgreSQL 18's `postgresql18-devel`,
-but not needed against 16 or 17 on the same OS. Since that could easily
-shift with future point releases, just install it up front regardless
-of version rather than relying on which majors currently need it. If
-you skip it and the build fails on a missing `gssapi/gssapi.h` or
-`krb5.h`, this package is why.
 
 ```bash
 cd pg_login_guard
@@ -227,7 +194,7 @@ shared_preload_libraries = 'pg_login_guard'
 # Optional tuning (defaults shown):
 pg_login_guard.enabled = on
 pg_login_guard.max_attempts = 5          # failed attempts allowed
-pg_login_guard.window = '5min'           # ...within this rolling window
+pg_login_guard.window_seconds = '5min'   # ...within this rolling window
 pg_login_guard.lockout_duration = '15min'
 pg_login_guard.max_tracked_roles = 1000  # requires restart to change
 ```
