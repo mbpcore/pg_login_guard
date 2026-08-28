@@ -35,12 +35,16 @@ server restart, same as fail2ban's in-memory ban list.
 
 ```mermaid
 flowchart TD
-    A[Client attempts to connect as role X] --> B[Postgres checks credentials]
+    A[Client attempts to connect as role X] --> Z{Is X in exempt_roles?}
+    Z -->|Yes| ZZ[Skip entirely - never tracked, never locked]
+    Z -->|No| B[Postgres checks credentials]
     B --> C{Is X currently locked?}
     C -->|Yes| D["FATAL: reject\n(even if credentials were correct)"]
     C -->|No| E{Did credentials check out?}
     E -->|Yes| F[Clear X's failure history\nlogin proceeds normally]
-    E -->|No| G{Previous failure window\nstill active?}
+    E -->|No| M{Already tracked, or\ndoes X exist as a role?}
+    M -->|No, not tracked and\ndoesn't exist| N[Ignore - no protective\nvalue in tracking it]
+    M -->|Yes| G{Previous failure window\nstill active?}
     G -->|No, expired| H[Start a new window\ncount = 1]
     G -->|Yes| I[count += 1]
     H --> J{count >= max_attempts?}
@@ -49,23 +53,34 @@ flowchart TD
     J -->|No| L[Just record the failure]
 ```
 
-1. **Locked check first.** If the role already has an active lock, the
+1. **Exempt check first.** If the role name is in
+   `pg_login_guard.exempt_roles`, it's invisible to the extension —
+   never tracked, never locked, no matter what.
+2. **Locked check next.** If the role already has an active lock, the
    connection is rejected with `FATAL` — regardless of whether the
    password this time was actually correct. This is what makes it a real
    lockout and not just a counter: a correct password doesn't let you
    back in early.
-2. **Success clears history.** If authentication just succeeded and the
+3. **Success clears history.** If authentication just succeeded and the
    role wasn't locked, any tracking record for it is deleted. A clean
    login resets the slate.
-3. **Failure advances the counter.** If authentication failed: if the
+4. **A never-tracked failure against a nonexistent role is ignored.**
+   Locking out a role that doesn't exist protects nothing, and ignoring
+   it closes off the cheapest way to fill the tracking table with junk
+   usernames. A role already being tracked keeps being tracked even if
+   it's later dropped — this check only applies to *starting* a new
+   tracking entry.
+5. **Failure advances the counter.** For a real, tracked role: if the
    previous failure window has expired, a fresh window starts at count 1;
-   otherwise the count increments.
-4. **Threshold trips the lock.** Once the count reaches `max_attempts`
+   otherwise the count increments. If the table is full and this needs a
+   new entry, the oldest entry (preferring one that isn't currently
+   locked) is evicted first to make room.
+6. **Threshold trips the lock.** Once the count reaches `max_attempts`
    within `window`, the role is locked for `lockout_duration`, and a line
    is written to the server log.
-5. **Auto-expiry.** Nothing has to happen for the lock to lift — the next
+7. **Auto-expiry.** Nothing has to happen for the lock to lift — the next
    connection attempt after `locked_until` simply proceeds normally,
-   because step 1 no longer finds an active lock.
+   because step 2 no longer finds an active lock.
 
 ## Features
 
@@ -87,11 +102,19 @@ flowchart TD
   | `pg_login_guard_unlock(role_name)` | Clears a lock immediately, before it would naturally expire | superuser only |
   | `pg_login_guard_reset(role_name)` | Wipes all tracking history for a role (as if it never failed) | superuser only |
 
-- **Fails safe under load** — if the shared tracking table fills up, new
-  entries are just dropped with a `WARNING` in the log rather than
-  crashing or blocking connections (see the capacity note under
-  `max_tracked_roles` below, and the fake-username exhaustion caveat in
-  [README.md](README.md#security-considerations)).
+- **Only tracks real roles** — a failed attempt against a username that
+  doesn't exist creates no tracking entry at all, closing off the
+  cheapest way to exhaust the table with junk usernames.
+- **Exempt roles** — list break-glass/service accounts in
+  `pg_login_guard.exempt_roles` and they're never tracked or locked,
+  full stop.
+- **Fails safe under load** — if the table is at capacity when a new
+  real role needs tracking, the oldest entry (preferring one that isn't
+  currently locked) is evicted to make room, rather than the whole
+  table silently refusing new entries until a restart (see the capacity
+  note under `max_tracked_roles` below, and
+  [README.md](README.md#security-considerations) for the full picture,
+  including the residual risk this doesn't close).
 - **Near-zero overhead** — no disk I/O, no catalog writes, one
   hash-table operation under a brief lock per connection attempt (see
   [README.md](README.md#performance)).
@@ -109,6 +132,7 @@ all:
 | `pg_login_guard.window_seconds` | `5min` | Yes (`SIGHUP`) | Time span failures are counted within. Accepts unit suffixes (`s`, `min`, `h`). |
 | `pg_login_guard.lockout_duration` | `15min` | Yes (`SIGHUP`) | How long a role stays locked once tripped. |
 | `pg_login_guard.max_tracked_roles` | `1000` | **No** (`PGC_POSTMASTER` — requires restart) | Capacity of the shared-memory table; sizes it at server startup. |
+| `pg_login_guard.exempt_roles` | `''` | Yes (`SIGHUP`) | Comma-separated role names never tracked or locked — e.g. a break-glass superuser. |
 
 Example:
 
@@ -119,6 +143,7 @@ pg_login_guard.max_attempts = 5
 pg_login_guard.window_seconds = '5min'
 pg_login_guard.lockout_duration = '15min'
 pg_login_guard.max_tracked_roles = 1000
+pg_login_guard.exempt_roles = 'postgres'
 ```
 
 Everything except `max_tracked_roles` can be tuned live with
@@ -194,14 +219,26 @@ worth knowing it's not "the last 5 minutes on a sliding clock."
 
 ### Where `max_tracked_roles = 1000` comes in
 
-The extension keeps a fixed-size table for up to 1000 *distinct*
-usernames being tracked at once — real or attempted. If you have, say,
-50 real application roles, this config leaves huge headroom. It only
-becomes relevant if something (a scanner, a botnet) hammers the server
-with hundreds of different bogus usernames — after 1000 distinct ones
-are being tracked simultaneously, new ones stop being recorded (logged
-as a `WARNING`) until old entries clear out. Worth glancing at
-`pg_login_guard_status()` occasionally, or watching the log for that
-warning, if this server is internet-facing. See
-[README.md](README.md#security-considerations) for more on this as a
-potential denial-of-service vector.
+The extension keeps a fixed-size table for up to 1000 *distinct real
+roles* being tracked at once (usernames that don't exist are never
+tracked at all — see Features above). If you have, say, 50 real
+application roles, this config leaves huge headroom. It only becomes
+relevant if something hammers the server with failed logins against
+many different *real* role names — once 1000 are being tracked
+simultaneously, adding a new one evicts the oldest existing entry
+(preferring one that isn't currently locked) to make room, rather than
+refusing to track anything further. Worth glancing at
+`pg_login_guard_status()` occasionally, or watching the server log for
+`tracking table full, evicting`, if this server is internet-facing and
+has many real roles. See [README.md](README.md#security-considerations)
+for the full picture, including the residual risk this doesn't close.
+
+### Exempting roles from tracking entirely
+
+Set `pg_login_guard.exempt_roles = 'postgres,replicator'` (comma-separated,
+any number of roles) to make specific accounts invisible to this
+extension — no tracking, no counting, no locking, regardless of how many
+times authentication against them fails. This is the direct answer to
+"anyone can lock out my superuser with zero credentials" — exempt the
+accounts where availability matters more than brute-force resistance,
+and let the rest of your roles stay protected.

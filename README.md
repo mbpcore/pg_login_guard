@@ -21,16 +21,25 @@ as fail2ban's in-memory ban list.
 
 Inside the auth hook, per connection attempt:
 
+0. If the role name is listed in `pg_login_guard.exempt_roles`, it's
+   skipped entirely — no tracking, no locking, regardless of outcome.
 1. If the role is currently locked, the connection is rejected
    (`FATAL`) regardless of whether the credentials were actually
    correct.
 2. Otherwise, if authentication just **succeeded**, any tracking history
    for that role is cleared.
 3. Otherwise (authentication just **failed**):
+   - If this role isn't already being tracked and doesn't resolve to a
+     real, existing role, nothing is recorded — locking out a role that
+     doesn't exist has no protective value, and this closes off the
+     cheapest way to fill the tracking table with junk.
    - If the previous failure window expired, a new one starts at count 1.
    - Otherwise the counter is incremented.
    - If the counter reaches `pg_login_guard.max_attempts`, the role is
      locked for `pg_login_guard.lockout_duration`.
+   - If the table is full and this role needs a new entry, the oldest
+     existing entry is evicted first (preferring one that isn't
+     currently locked) to make room.
 
 ## Files
 
@@ -208,7 +217,14 @@ pg_login_guard.max_attempts = 5          # failed attempts allowed
 pg_login_guard.window_seconds = '5min'   # ...within this rolling window
 pg_login_guard.lockout_duration = '15min'
 pg_login_guard.max_tracked_roles = 1000  # requires restart to change
+pg_login_guard.exempt_roles = ''         # e.g. 'postgres,replicator'
 ```
+
+`exempt_roles` is a comma-separated list of role names that are never
+tracked or locked, no matter how many times they fail — put your
+break-glass superuser and any service/replication roles here if losing
+access to them for `lockout_duration` would be worse than the brute-force
+risk itself (see [Security considerations](#security-considerations)).
 
 > **Upgrading from a build with `pg_login_guard.window` (no `_seconds`)?**
 > That name was changed because `WINDOW` is a reserved word in
@@ -284,47 +300,61 @@ pass.
   policy, not a bug specific to this extension (the same is true of
   fail2ban, AD account-lockout policies, etc.). Anyone who knows a role
   name can lock it by deliberately failing to authenticate as it
-  `max_attempts` times. Weigh this before enabling for roles where
-  availability matters more than brute-force resistance, and consider
-  excluding your break-glass superuser role once an allowlist exists
-  (see Known limitations below).
-- **Fake-username table exhaustion.** The shared-memory tracking table
-  has a fixed capacity (`pg_login_guard.max_tracked_roles`, default
-  1000). `ClientAuthentication_hook` fires — and a tracking entry gets
-  created — for *any* attempted username that reaches a `pg_hba.conf`
-  line using a credential-checking method (`password`, `md5`,
-  `scram-sha-256`, `gss`, ...), including ones that don't correspond to
-  a real role — PostgreSQL runs a mock authentication exchange for a
-  nonexistent role specifically so a failure doesn't reveal whether the
-  role exists, and that mock exchange still reports failure through the
-  normal path our hook sees. An unauthenticated remote attacker can
-  exploit this: send `max_tracked_roles` failed connections using that
-  many distinct made-up usernames (cheap — no valid credentials needed
-  for any of them) to fill the table. Once full, new entries are
-  silently dropped (a `WARNING` is logged) — meaning brute-force
-  tracking is effectively disabled for every *real* role until a
-  restart or enough entries clear naturally. There's no eviction of
-  stale/never-succeeded entries today. This is narrower than it sounds
-  if your `pg_hba.conf` is otherwise locked down: connections rejected
-  by an explicit `reject` line, or that don't match *any* line
-  (PostgreSQL's implicit reject), never reach `ClientAuthentication()`'s
-  hook-invocation code at all — `ereport(FATAL, ...)` fires straight
-  from inside the `reject`/implicit-reject branch, so that traffic can't
-  contribute to this exhaustion. It's a real risk specifically for the
-  realistic case this extension exists for: a `pg_hba.conf` line
-  offering `scram-sha-256`/`md5`/`password` broadly (e.g. to any host,
-  for any role) so legitimate remote clients can authenticate at all —
-  by construction, that same line accepts an attacker's made-up
-  usernames into the mock-auth path too. Practical mitigations: size
-  `max_tracked_roles` well above your real role count so this requires
-  a large sustained attempt volume, watch the server log for the
-  `tracking table is full` warning, and/or scope that `pg_hba.conf` line
-  as tightly as you can (specific source addresses/networks rather than
-  `0.0.0.0/0`). A real fix would be to only create a tracking entry for
-  usernames that resolve to an existing role, or add LRU eviction —
-  both are non-trivial from inside this hook (catalog lookups need a
-  transaction context that isn't reliably available this early) and
-  aren't implemented yet.
+  `max_attempts` times. **Mitigation available:** put your break-glass
+  superuser and any service/replication roles in
+  `pg_login_guard.exempt_roles` — they're then never tracked or locked,
+  no matter how many times authentication against them fails.
+- **Fake-username table exhaustion — largely fixed.** A tracking entry
+  used to get created for *any* attempted username that reached a
+  credential-checking `pg_hba.conf` line, including ones that don't
+  correspond to a real role at all (PostgreSQL runs a mock
+  authentication exchange for a nonexistent role specifically so a
+  failure doesn't reveal whether the role exists, and that mock
+  exchange still reports failure through the normal path our hook
+  sees). That made it cheap for an unauthenticated attacker to fill the
+  table with made-up usernames and disable tracking for every real
+  role. Two fixes now apply together:
+  - A new entry is only created for a username that `get_role_oid()`
+    confirms is a real, existing role. Verified by testing: 5 failed
+    attempts against a nonexistent username created zero tracking
+    entries and caused no crash (this needed checking specifically -
+    `ClientAuthentication_hook` runs before most of a backend's normal
+    startup, and a catalog lookup that assumes more infrastructure is
+    up than actually is could crash the connection; it didn't, most
+    likely because password/SCRAM authentication itself already relies
+    on the same kind of lookup - `get_role_password()` - to fetch the
+    stored verifier at this same point in the connection).
+  - If the table is at `max_tracked_roles` capacity when a *new* real
+    role needs tracking, the oldest entry is evicted to make room
+    (preferring an oldest entry that isn't currently locked, so a flood
+    of new usernames can't silently lift someone's active lock early
+    just to make space for itself - falls back to evicting the oldest
+    *locked* entry only if every tracked entry is locked). Verified by
+    testing both branches directly against a live server.
+
+  Residual risk: an attacker who already knows (or can guess) many real
+  role names can still exhaust the table with those - eviction bounds
+  how long that lasts (a one-time flood no longer disables tracking
+  until restart) but doesn't prevent it from happening continuously
+  under sustained pressure. As before, this only applies to attempts
+  that reach a `pg_hba.conf` line using a credential-checking method -
+  an explicit `reject` line, or no matching line at all (PostgreSQL's
+  implicit reject), never reaches `ClientAuthentication()`'s
+  hook-invocation code, so that traffic can't contribute to this at
+  all.
+- **Fixed: `max_tracked_roles` wasn't actually a hard cap.** Found while
+  testing the eviction fix above: a dynahash table created via
+  `ShmemInitHash` does not fail `HASH_ENTER` right at the `max_size`
+  hint passed to it - that value only sizes the initial shared-memory
+  request, and the table can silently grow well past it into whatever
+  slack that sizing left. Confirmed by testing: with
+  `max_tracked_roles = 10`, the table kept accepting new distinct roles
+  past 60 entries without complaint or eviction. Fixed by checking
+  `hash_get_num_entries()` against `max_tracked_roles` explicitly before
+  inserting, rather than relying on `HASH_ENTER_NULL` to fail on its
+  own - which also means the eviction logic above actually gets a
+  chance to run at the threshold you configure, instead of some much
+  larger and less predictable point.
 - `pg_login_guard_status()` is superuser-only by default (as of the
   `REVOKE ALL ... FROM PUBLIC` in the install script) — earlier it was
   left PUBLIC-readable, which handed any authenticated user in the
@@ -383,8 +413,17 @@ default `max_tracked_roles`, scaling linearly with it).
 - No per-IP tracking (only per-role); an attacker rotating through many
   roles from one IP isn't slowed down. Could be extended to key on
   `(rolename, client_addr)` or add a separate per-IP table.
-- No allowlist for exempting specific roles (e.g. replication roles, a
-  break-glass superuser) from lockout — everyone is tracked today.
+- Auth methods other than `scram-sha-256` (and the confirmed
+  `reject`/implicit-reject bypass) haven't been individually verified to
+  reach `ClientAuthentication_hook` the same way — `cert`, `gss`,
+  `ldap`, `radius`, `pam`, `ident`, and `peer` are untested.
+- Doesn't reduce server load during an attack. The hook runs *after*
+  PostgreSQL completes the full authentication handshake for that
+  connection, locked account or not - being locked skips nothing on the
+  server's side, it just prevents the attempt from ultimately
+  succeeding. Pair with `pg_hba.conf` scoping, a firewall/security-group
+  rate limit, or a connection limiter (PgBouncer, `max_connections`) if
+  connection-flood resistance is also a goal.
 
 ## Author
 

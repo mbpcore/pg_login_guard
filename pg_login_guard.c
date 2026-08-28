@@ -21,6 +21,7 @@
 #include "libpq/auth.h"
 #include "libpq/libpq-be.h"
 #include "miscadmin.h"
+#include "nodes/pg_list.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -29,6 +30,7 @@
 #include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/timestamp.h"
+#include "utils/varlena.h"
 
 PG_MODULE_MAGIC;
 
@@ -68,6 +70,7 @@ static int  guard_max_attempts = 5;
 static int  guard_window_seconds = 300;      /* 5 min, GUC_UNIT_S */
 static int  guard_lockout_seconds = 900;     /* 15 min, GUC_UNIT_S */
 static int  guard_max_tracked_roles = 1000;  /* PGC_POSTMASTER */
+static char *guard_exempt_roles = NULL;      /* comma-separated role names */
 
 /* ---- previous hooks ---- */
 static ClientAuthentication_hook_type prev_client_auth_hook = NULL;
@@ -83,6 +86,8 @@ static void pg_login_guard_shmem_request(void);
 static void pg_login_guard_shmem_startup(void);
 static void pg_login_guard_auth_check(Port *port, int status);
 static void guard_copy_key(char *dst, const char *src);
+static bool guard_role_is_exempt(const char *rolename);
+static void guard_evict_one_for_new_entry(TimestampTz now);
 
 PG_FUNCTION_INFO_V1(pg_login_guard_status);
 PG_FUNCTION_INFO_V1(pg_login_guard_unlock);
@@ -145,6 +150,14 @@ _PG_init(void)
                              1000, 10, 1000000,
                              PGC_POSTMASTER, 0,
                              NULL, NULL, NULL);
+
+    DefineCustomStringVariable("pg_login_guard.exempt_roles",
+                                "Comma-separated role names never tracked or locked (e.g. a break-glass superuser).",
+                                NULL,
+                                &guard_exempt_roles,
+                                "",
+                                PGC_SIGHUP, GUC_LIST_INPUT,
+                                NULL, NULL, NULL);
 
     MarkGUCPrefixReserved("pg_login_guard");
 
@@ -230,6 +243,93 @@ guard_copy_key(char *dst, const char *src)
 }
 
 /*
+ * guard_role_is_exempt
+ *      Is rolename listed in pg_login_guard.exempt_roles? Parsed fresh on
+ *      every call rather than cached: the list is expected to be short
+ *      (a handful of break-glass/service roles), so a few strcmp() calls
+ *      per connection attempt is cheap next to the rest of authentication,
+ *      and this avoids needing a memory context + GUC-assign-hook dance to
+ *      keep a cached copy in sync across SIGHUP reloads.
+ */
+static bool
+guard_role_is_exempt(const char *rolename)
+{
+    char       *rawstring;
+    List       *elemlist;
+    ListCell   *lc;
+    bool        result = false;
+
+    if (guard_exempt_roles == NULL || guard_exempt_roles[0] == '\0')
+        return false;
+
+    rawstring = pstrdup(guard_exempt_roles);
+
+    if (!SplitIdentifierString(rawstring, ',', &elemlist))
+    {
+        /* Malformed list (shouldn't happen for a GUC-validated string). */
+        pfree(rawstring);
+        list_free(elemlist);
+        return false;
+    }
+
+    foreach(lc, elemlist)
+    {
+        if (strcmp((char *) lfirst(lc), rolename) == 0)
+        {
+            result = true;
+            break;
+        }
+    }
+
+    list_free(elemlist);
+    pfree(rawstring);
+    return result;
+}
+
+/*
+ * guard_evict_one_for_new_entry
+ *      Called with loginGuardLock held exclusively, only when the table is
+ *      completely full and a new role needs a slot. Evicts one entry to
+ *      make room: prefers the oldest entry that is NOT currently locked
+ *      (so a flood of new usernames can't silently lift someone's active
+ *      lock early just to make room for itself), falling back to the
+ *      oldest entry overall only if every tracked entry is locked.
+ */
+static void
+guard_evict_one_for_new_entry(TimestampTz now)
+{
+    HASH_SEQ_STATUS seq;
+    LoginGuardEntry *cur;
+    LoginGuardEntry *victim = NULL;
+    bool        victim_locked = false;
+
+    hash_seq_init(&seq, loginGuardHash);
+    while ((cur = (LoginGuardEntry *) hash_seq_search(&seq)) != NULL)
+    {
+        bool        cur_locked = (cur->locked_until != 0 && now < cur->locked_until);
+
+        if (victim == NULL ||
+            (victim_locked && !cur_locked) ||
+            (victim_locked == cur_locked && cur->window_started < victim->window_started))
+        {
+            victim = cur;
+            victim_locked = cur_locked;
+        }
+    }
+    /* Loop only exits via hash_seq_search() returning NULL, i.e. the scan
+     * ran to completion and already self-terminated - no hash_seq_term(). */
+
+    if (victim != NULL)
+    {
+        ereport(LOG,
+                (errmsg("pg_login_guard: tracking table full, evicting %s entry for role \"%s\" to make room",
+                        victim_locked ? "locked" : "oldest",
+                        victim->rolename)));
+        (void) hash_search(loginGuardHash, victim->rolename, HASH_REMOVE, NULL);
+    }
+}
+
+/*
  * pg_login_guard_auth_check
  *      ClientAuthentication_hook implementation.
  *
@@ -253,6 +353,9 @@ pg_login_guard_auth_check(Port *port, int status)
         return;
 
     if (port->user_name == NULL || port->user_name[0] == '\0')
+        return;
+
+    if (guard_role_is_exempt(port->user_name))
         return;
 
     guard_copy_key(keyname, port->user_name);
@@ -290,13 +393,50 @@ pg_login_guard_auth_check(Port *port, int status)
     /* Failed login: record/advance the counter. */
     if (!found)
     {
+        /*
+         * Only start tracking usernames that resolve to a real role -
+         * locking out a role that doesn't exist has no protective value,
+         * and this blunts the fake-username table-exhaustion DoS (see
+         * README). get_role_oid() does a syscache lookup; PostgreSQL's
+         * own password/SCRAM checks already do the same kind of lookup
+         * this early in the connection (they have to, to fetch the
+         * stored verifier), so catalog access is evidently available at
+         * this point in ClientAuthentication_hook.
+         */
+        if (!OidIsValid(get_role_oid(port->user_name, true)))
+        {
+            LWLockRelease(loginGuardLock);
+            return;
+        }
+
+        /*
+         * Enforce max_tracked_roles as a real cap ourselves: a dynahash
+         * table created via ShmemInitHash does not hard-fail HASH_ENTER
+         * right at the max_size hint passed to it - that value only
+         * sizes the initial shared memory request, and the table can
+         * grow well past it into whatever slack that sizing left before
+         * HASH_ENTER_NULL would actually start returning NULL (confirmed
+         * by testing: with max_tracked_roles=10, HASH_ENTER_NULL kept
+         * succeeding past 60 distinct entries). Checking the live count
+         * here makes the GUC's documented cap real regardless of that
+         * slack, and gives guard_evict_one_for_new_entry() a chance to
+         * run at the threshold callers actually configured.
+         */
+        if (hash_get_num_entries(loginGuardHash) >= guard_max_tracked_roles)
+            guard_evict_one_for_new_entry(now);
+
         entry = (LoginGuardEntry *) hash_search(loginGuardHash, keyname, HASH_ENTER_NULL, &found);
         if (entry == NULL)
         {
-            /* Table full; degrade gracefully rather than crash a backend. */
+            /*
+             * Shouldn't happen right after the eviction above frees a
+             * slot; this also covers dynahash's own true-capacity
+             * failure if that's ever actually reached. Degrade
+             * gracefully rather than crash a backend either way.
+             */
             LWLockRelease(loginGuardLock);
             ereport(WARNING,
-                    (errmsg("pg_login_guard: tracking table is full, cannot record failed attempt for role \"%s\"",
+                    (errmsg("pg_login_guard: could not record failed attempt for role \"%s\" (tracking table full)",
                             port->user_name),
                      errhint("Increase pg_login_guard.max_tracked_roles and restart.")));
             return;
